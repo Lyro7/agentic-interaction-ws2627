@@ -1,1 +1,1 @@
-# agentic-human-ai-interaction
+# Agentic Human-AI Interaction
