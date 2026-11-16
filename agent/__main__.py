@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Tool description for the LLM
+MAX_STEPS = 5
+
 tools = [
     {
         "type": "function",
@@ -31,7 +32,6 @@ tools = [
     }
 ]
 
-# Actual tool implementation
 def getCalendar(date: str):
     base_url = os.environ["DATA_BASE_URL"].rstrip("/")
     url = f"{base_url}/calendar/{date}.json"
@@ -45,7 +45,6 @@ def getCalendar(date: str):
 
     return response.json()
 
-# JSONL logging
 def writeLog(log_file, run_id, event, model, ok=True,
              tool=None, args=None, duration_ms=0, **extra):
 
@@ -67,12 +66,10 @@ def writeLog(log_file, run_id, event, model, ok=True,
 def main():
     question = " ".join(sys.argv[1:])
 
-    # Load the .env file and make the environment variables accessible
     load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
     
     model = None
 
-    # Create one log file per run
     run_id = str(uuid.uuid4())
 
     log_dir = Path(__file__).resolve().parent.parent / "logs"
@@ -93,7 +90,7 @@ def main():
             raise ValueError("No question provided.")
 
         client = OpenAI(
-            api_key=os.environ["OPENAI_API_KEY"],
+            api_key =os.environ["OPENAI_API_KEY"],
             base_url=os.environ["OPENAI_BASE_URL"]
         )
 
@@ -102,85 +99,87 @@ def main():
                 "role": "system",
                 "content": (
                     "You are a calendar assistant. "
-                    "Use getCalendar to answer questions about calendar appointments. "
-                    "Only report appointments returned by the tool. "
-                    "If no data is available, explain that clearly."
+                    "Call getCalendar for every date requested before giving a final answer. "
+                    "If a lookup fails, report the failure for that date and continue "
+                    "with all remaining dates. "
+                    "Report the result for each date separately using only tool results. "
+                    "Write the final answer in plain language, grouped by date. "
+                    "For each event, list the time, title, and location if available. "
+                    "If events is an empty list, say 'No events scheduled' for that date. "
+                    "Only report a failed lookup if the tool result contains an error field. "
+                    "Never output raw JSON."
                 )
             },
             {"role": "user", "content": question}
         ]
+        
+        for step in range(MAX_STEPS):
 
-        # First model call
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=tools,
-            tool_choice="required"
-        )
-
-        message = response.choices[0].message
-        messages.append(message)
-
-        if not message.tool_calls:
-            raise RuntimeError("Model did not request a tool.")
-
-        # Execute requested tools
-        for call in message.tool_calls:
-            args = json.loads(call.function.arguments)
-
-            writeLog(
-                log_file, run_id, "tool_call", model,
-                tool=call.function.name,
-                args=args
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto"
             )
 
-            tool_start = time.perf_counter()
+            message = response.choices[0].message
+            messages.append(message)
 
-            try:
-                if call.function.name != "getCalendar":
-                    raise ValueError(f"Unknown tool: {call.function.name}")
+            if not message.tool_calls:
+                answer = message.content
+                break
+            
+            for call in message.tool_calls:
+                args = None
+                tool_start = time.perf_counter()
 
-                result = getCalendar(args["date"])
+                try:
+                    args = json.loads(call.function.arguments)
 
-                writeLog(
+                    writeLog(
+                        log_file, run_id, "tool_call", model,
+                        tool=call.function.name,
+                        args=args
+                    )
+
+                    if call.function.name != "getCalendar":
+                        raise ValueError(f"Unknown tool: {call.function.name}")
+
+                    result = getCalendar(args["date"])
+
+                except Exception as error:
+                    result = {"error": str(error)}
+                    writeLog(
+                        log_file, run_id, "tool_result", model,
+                        ok=False,
+                        tool=call.function.name,
+                        args=args,
+                        duration_ms=(
+                            time.perf_counter() - tool_start
+                        ) * 1000,
+                        error=str(error)
+                    )
+
+                else:
+                    writeLog(
                     log_file, run_id, "tool_result", model,
                     tool=call.function.name,
                     args=args,
-                    duration_ms=(
-                        time.perf_counter() - tool_start
-                    ) * 1000,
-                    result=result
+                    duration_ms=(time.perf_counter() - tool_start) * 1000,
+                    result=result,
                 )
+                    
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(result, ensure_ascii=False)
+                })
 
-            except Exception as error:
-                writeLog(
-                    log_file, run_id, "tool_result", model,
-                    ok=False,
-                    tool=call.function.name,
-                    args=args,
-                    duration_ms=(
-                        time.perf_counter() - tool_start
-                    ) * 1000,
-                    error=str(error)
-                )
-                raise
+        else:
+            raise RuntimeError("Step limit reached.")
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call.id,
-                "content": json.dumps(result, ensure_ascii=False)
-            })
-
-        # Second model call
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages
-        )
-
-        answer = response.choices[0].message.content
-
-        if answer is None:
-            raise RuntimeError("Model returned no final answer.")
+        if not answer or not answer.strip():
+            raise RuntimeError("Model returned no final answer")
 
         writeLog(
             log_file, run_id, "final", model,
