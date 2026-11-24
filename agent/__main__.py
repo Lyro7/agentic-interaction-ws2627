@@ -3,47 +3,15 @@ import sys
 import json
 import uuid
 import time
-import requests
 
 from pathlib import Path
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from .tools import tool_handlers, tools
+
 MAX_STEPS = 5
-
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "getCalendar",
-            "description": "Get calendar events for a given date.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date": {
-                        "type": "string",
-                        "description": "Calendar date in YYYY-MM-DD format."
-                    }
-                },
-                "required": ["date"]
-            }
-        }
-    }
-]
-
-def getCalendar(date: str):
-    base_url = os.environ["DATA_BASE_URL"].rstrip("/")
-    url = f"{base_url}/calendar/{date}.json"
-
-    response = requests.get(url, timeout=10)
-
-    if response.status_code == 404:
-        return {"message": f"No calendar data available for {date}."}
-
-    response.raise_for_status()
-
-    return response.json()
 
 def writeLog(log_file, run_id, event, model, ok=True,
              tool=None, args=None, duration_ms=0, **extra):
@@ -96,19 +64,27 @@ def main():
 
         messages = [
             {
-                "role": "system",
-                "content": (
-                    "You are a calendar assistant. "
-                    "Call getCalendar for every date requested before giving a final answer. "
-                    "If a lookup fails, report the failure for that date and continue "
-                    "with all remaining dates. "
-                    "Report the result for each date separately using only tool results. "
-                    "Write the final answer in plain language, grouped by date. "
-                    "For each event, list the time, title, and location if available. "
-                    "If events is an empty list, say 'No events scheduled' for that date. "
-                    "Only report a failed lookup if the tool result contains an error field. "
-                    "Never output raw JSON."
-                )
+            "role": "system",
+            "content": (
+                "You are an assistant for calendar events, weather, and train connections. "
+                "Use getCalendar for every requested calendar date, getWeather for weather "
+                "questions and umbrella recommendations, and getTransit for train journeys. "
+                "For combined questions, call every relevant tool before answering. "
+
+                "Use lowercase city slugs such as ulm and muenchen (Munich). "
+                "If no train origin is stated or implied, assume Ulm and clearly state this. "
+                "For travel weather, use the destination unless another place is specified. "
+
+                "Base all factual claims and recommendations on tool results. "
+                "Never invent missing values. If data is unavailable, say so explicitly. "
+                "If a lookup fails, identify the affected lookup and continue with any "
+                "remaining results. "
+
+                "Group the final answer by date and write in plain language. "
+                "For calendar events, include the time, title, and location when available. "
+                "If the events list is empty, say 'No events scheduled' for that date. "
+                "Never output raw JSON."
+            )
             },
             {"role": "user", "content": question}
         ]
@@ -142,10 +118,11 @@ def main():
                         args=args
                     )
 
-                    if call.function.name != "getCalendar":
+                    handler = tool_handlers.get(call.function.name)
+                    if handler is None:
                         raise ValueError(f"Unknown tool: {call.function.name}")
 
-                    result = getCalendar(args["date"])
+                    result = handler(**args)
 
                 except Exception as error:
                     result = {"error": str(error)}
